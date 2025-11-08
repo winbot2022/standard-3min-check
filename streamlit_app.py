@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
-# 3分無料診断（JST対応 / 1ページPDF強化 / AIコメント自動生成）
+# 3分無料診断（JST / 1ページPDF最適化 / AIコメント自動生成）
 # - 設問10問 → スコア化 → 6タイプ判定 → 信号色表示
 # - PDF出力（日本語TTF埋め込み、棒グラフ、ロゴ・QR最適化、1ページ収まり強化）
 # - ログ保存（Google Sheets / CSV）
-# - OpenAIで“約300字”のAIコメントを**自動生成**（Secrets/環境変数両対応）
+# - OpenAIで“約300字”のAIコメントを自動生成（Secrets/環境変数両対応）
 # - ロゴはローカル優先（assets/CImark.png）→ 失敗時はURL取得
 
 import os
@@ -41,13 +41,16 @@ from google.oauth2.service_account import Credentials
 
 # ========= ブランド & 定数 =========
 BRAND_BG = "#f0f7f7"
-LOGO_LOCAL = "assets/CImark.png"  # ← GitHub/Streamlit Cloud用
+LOGO_LOCAL = "assets/CImark.png"  # GitHub/Streamlit Cloud用
 LOGO_URL   = "https://victorconsulting.jp/wp-content/uploads/2025/10/CImark.png"
 CTA_URL    = "https://victorconsulting.jp/spot-diagnosis/"
 OPENAI_MODEL = "gpt-4o-mini"
 
 # 日本時間
 JST = timezone(timedelta(hours=9))
+
+# コメントのクランプ上限（長文のみ省略。短文はそのまま）
+CLAMP_CHAR_LIMIT = 520
 
 st.set_page_config(
     page_title="3分無料診断｜Victor Consulting",
@@ -219,7 +222,7 @@ def fallback_append_to_csv(row_dict: dict, csv_path="responses.csv"):
 
 # ========= 図・QRユーティリティ =========
 def build_bar_png(df: pd.DataFrame) -> bytes:
-    fig, ax = plt.subplots(figsize=(5.0, 2.4), dpi=220)  # 少し小型化
+    fig, ax = plt.subplots(figsize=(5.0, 2.4), dpi=220)  # 小型化
     df_sorted = df.sort_values("平均スコア", ascending=True)
     ax.barh(df_sorted["カテゴリ"], df_sorted["平均スコア"])
     ax.set_xlim(0, 5)
@@ -306,9 +309,10 @@ def generate_ai_comment(company: str, main_type: str, df_scores: pd.DataFrame, o
     except Exception as e:
         return None, f"AIコメント生成でエラー: {e}"
 
-def clamp_comment(text: str, max_chars: int = 340) -> str:
-    if not text: return ""
-    t = " ".join(text.strip().split())  # 改行・連続空白を正規化
+def clamp_comment(text: str, max_chars: int = CLAMP_CHAR_LIMIT) -> str:
+    if not text:
+        return ""
+    t = " ".join(text.strip().split())  # 改行や連続空白を正規化
     return t if len(t) <= max_chars else (t[:max_chars - 1] + "…")
 
 # ========= PDF生成 =========
@@ -335,7 +339,7 @@ def make_pdf_bytes(result: dict, df_scores: pd.DataFrame, brand_hex=BRAND_BG) ->
     h3.spaceAfter = 4
 
     elems = []
-    # ロゴ（さらに小型化）
+    # ロゴ（小型化）
     if logo_path:
         elems.append(image_with_max_width(logo_path, max_w=120))
         elems.append(Spacer(1, 6))
@@ -352,7 +356,7 @@ def make_pdf_bytes(result: dict, df_scores: pd.DataFrame, brand_hex=BRAND_BG) ->
     elems.append(Spacer(1, 6))
 
     elems.append(Paragraph("診断コメント", h3))
-    elems.append(Paragraph(clamp_comment(result["comment"], 340), normal))
+    elems.append(Paragraph(clamp_comment(result["comment"], CLAMP_CHAR_LIMIT), normal))
     elems.append(Spacer(1, 6))
 
     # 表
@@ -373,11 +377,11 @@ def make_pdf_bytes(result: dict, df_scores: pd.DataFrame, brand_hex=BRAND_BG) ->
     elems.append(tbl)
     elems.append(Spacer(1, 6))
 
-    # 棒グラフ（小型化）
+    # 棒グラフ（微縮小）
     bar_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
     bar_tmp.write(bar_png); bar_tmp.flush()
     elems.append(Paragraph("カテゴリ別スコア（棒グラフ）", h3))
-    elems.append(Image(bar_tmp.name, width=400, height=190))
+    elems.append(Image(bar_tmp.name, width=390, height=180))
     elems.append(Spacer(1, 6))
 
     # 「次の一手」：左に文言、右にQR（QRも小型化）
@@ -385,7 +389,7 @@ def make_pdf_bytes(result: dict, df_scores: pd.DataFrame, brand_hex=BRAND_BG) ->
     url_par = Paragraph(f"詳細・お申込み：<u>{CTA_URL}</u>", normal)
     qr_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
     qr_tmp.write(qr_png); qr_tmp.flush()
-    qr_img = Image(qr_tmp.name, width=56, height=56)  # 60→56
+    qr_img = Image(qr_tmp.name, width=52, height=52)  # 56→52
 
     next_table = Table([[url_par, qr_img]], colWidths=[430, 70])
     nt_style = [
@@ -464,8 +468,7 @@ if st.session_state.get("result_ready"):
         if text:
             st.session_state["ai_comment"] = text
         elif err:
-            # API未設定などは静的にフォールバック
-            st.session_state["ai_comment"] = None  # Noneのまま→静的文言を表示
+            st.session_state["ai_comment"] = None
             st.toast("AIコメントは未設定のため、静的コメントを表示します。", icon="ℹ️")
 
     st.markdown("### 診断結果")
@@ -560,6 +563,7 @@ if st.session_state.get("result_ready"):
 
 else:
     st.caption("フォームに回答し、「診断する」を押してください。")
+
 
 
 
