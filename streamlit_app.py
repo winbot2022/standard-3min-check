@@ -1,15 +1,16 @@
 # -*- coding: utf-8 -*-
-# 3分無料診断（必須入力＋自動保存＋UTM保存 / JST / 1ページPDF / AIコメント自動生成）
-# - 会社名・メールを必須化（未入力や不正形式は診断ストップ）
-# - 診断完了時に自動保存：Google Sheets が設定されていればSheets、無ければCSVに追記
-# - UTM（source/medium/campaign）をクエリから取得し、ログに同時保存
-# - それ以外は従来通り：PDF（日本語TTF/ロゴ/QR/棒グラフ）、AIコメント自動生成
+# 3分無料診断｜Victor Consulting
+# - 会社名/メール必須、UTM取得、AIコメント自動生成、PDF 1ページ、JST
+# - Google Sheets 自動保存（なければ CSV）
+# - サイレント保存（利用者に保存メッセージを出さない）
+# - 管理者モード（?admin=1 または Secrets: ADMIN_MODE="1"）でイベント確認
 
 import os
 import io
 import re
 import json
 import time
+import base64
 import tempfile
 from datetime import datetime, timedelta, timezone
 
@@ -18,29 +19,27 @@ import pandas as pd
 import altair as alt
 import matplotlib.pyplot as plt
 
-# ReportLab（PDF）
+# PDF
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
-from reportlab.platypus import (
-    SimpleDocTemplate, Paragraph, Spacer, Image, Table, TableStyle
-)
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image, Table, TableStyle
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfbase.pdfmetrics import registerFontFamily
 
-# Matplotlib日本語フォント
+# Fonts/Images
 from matplotlib import font_manager
 from PIL import Image as PILImage
 import qrcode
 import requests
 
-# Google Sheets（任意）
+# Google Sheets
 import gspread
 from google.oauth2.service_account import Credentials
 
 # ========= ブランド & 定数 =========
-BRAND_BG = "#f0f7f7"
+BRAND_BG   = "#f0f7f7"
 LOGO_LOCAL = "assets/CImark.png"
 LOGO_URL   = "https://victorconsulting.jp/wp-content/uploads/2025/10/CImark.png"
 CTA_URL    = "https://victorconsulting.jp/spot-diagnosis/"
@@ -49,9 +48,7 @@ OPENAI_MODEL = "gpt-4o-mini"
 # 日本時間
 JST = timezone(timedelta(hours=9))
 
-# コメントのクランプ上限（長文のみ省略。短文はそのまま）
-CLAMP_CHAR_LIMIT = 520
-
+# 画面設定
 st.set_page_config(
     page_title="3分無料診断｜Victor Consulting",
     page_icon="✅",
@@ -59,40 +56,19 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# ---- session init ----
-defaults = {
-    "result_ready": False, "df": None, "overall_avg": None, "signal": None,
-    "main_type": None, "company": "", "email": "",
-    "ai_comment": None, "ai_tried": False,
-    "utm_source": "", "utm_medium": "", "utm_campaign": ""
-}
-for k, v in defaults.items():
-    if k not in st.session_state:
-        st.session_state[k] = v
-
-# ========= UTMの取得（クエリ文字列）=========
-# Streamlit Cloudは st.query_params でOK（旧APIは experimental_get_query_params）
-try:
-    q = st.query_params
-except Exception:
-    q = st.experimental_get_query_params()  # 互換
-st.session_state["utm_source"]   = q.get("utm_source",   [""])[0] if isinstance(q.get("utm_source"), list) else q.get("utm_source", "")
-st.session_state["utm_medium"]   = q.get("utm_medium",   [""])[0] if isinstance(q.get("utm_medium"), list) else q.get("utm_medium", "")
-st.session_state["utm_campaign"] = q.get("utm_campaign", [""])[0] if isinstance(q.get("utm_campaign"), list) else q.get("utm_campaign", "")
-
-# 管理者モード（?admin=1 でON、または Secrets の ADMIN_MODE="1"）
-try:
-    qp = st.query_params
-except Exception:
-    qp = st.experimental_get_query_params()
-ADMIN_MODE = (str(qp.get("admin", ["0"])[0]) == "1") or (str(read_secret("ADMIN_MODE", "0")) == "1")
-
 # ========= Secrets/環境変数 =========
 def read_secret(key: str, default=None):
     try:
         return st.secrets[key]
     except Exception:
         return os.environ.get(key, default)
+
+# ========= 管理者モード =========
+try:
+    qp = st.query_params
+except Exception:
+    qp = st.experimental_get_query_params()
+ADMIN_MODE = (str(qp.get("admin", ["0"])[0]) == "1") or (str(read_secret("ADMIN_MODE", "0")) == "1")
 
 # ========= 日本語TTF 登録 =========
 def setup_japanese_font():
@@ -118,7 +94,6 @@ def setup_japanese_font():
     except Exception as e:
         print("Matplotlib font register error:", e)
     return font_path
-
 FONT_PATH_IN_USE = setup_japanese_font()
 
 # ========= スタイル =========
@@ -144,7 +119,7 @@ hr {{ border:none; border-top:1px dotted #c9d7d7; margin:1.0rem 0; }}
     unsafe_allow_html=True
 )
 
-# ========= ロゴ取得（ローカル優先 → URLフォールバック） =========
+# ========= ロゴ取得 =========
 def path_or_download_logo() -> str | None:
     if os.path.exists(LOGO_LOCAL):
         return LOGO_LOCAL
@@ -158,6 +133,103 @@ def path_or_download_logo() -> str | None:
         pass
     return None
 
+# ========= イベント記録（管理者用） =========
+def _report_event(level: str, message: str, payload: dict | None = None):
+    """障害・警告を“管理者だけ”が後から確認できるように記録。
+       優先: Google Sheets の 'events' シート → 無ければ CSV(events.csv)
+       画面には出さない。ADMIN_MODE時のみ小さく表示。
+    """
+    evt = {
+        "timestamp": datetime.now(JST).isoformat(timespec="seconds"),
+        "level": level,
+        "message": message,
+        "payload": json.dumps(payload, ensure_ascii=False) if payload else ""
+    }
+    # Sheets優先
+    secret_json     = read_secret("GOOGLE_SERVICE_JSON", None)
+    secret_sheet_id = read_secret("SPREADSHEET_ID", None)
+    wrote = False
+    try:
+        if secret_json and secret_sheet_id:
+            scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+            info = json.loads(secret_json)
+            creds = Credentials.from_service_account_info(info, scopes=scopes)
+            gc = gspread.authorize(creds)
+            sh = gc.open_by_key(secret_sheet_id)
+            try:
+                ws = sh.worksheet("events")
+            except gspread.WorksheetNotFound:
+                ws = sh.add_worksheet(title="events", rows=1000, cols=6)
+                ws.append_row(list(evt.keys()))
+            ws.append_row([evt[k] for k in evt.keys()])
+            wrote = True
+    except Exception as e:
+        wrote = False
+    # CSVフォールバック
+    if not wrote:
+        try:
+            df = pd.DataFrame([evt])
+            csv_path = "events.csv"
+            if os.path.exists(csv_path):
+                df.to_csv(csv_path, mode="a", header=False, index=False, encoding="utf-8")
+            else:
+                df.to_csv(csv_path, index=False, encoding="utf-8")
+        except Exception:
+            pass
+    if ADMIN_MODE:
+        st.caption(f"［ADMIN］{level}: {message}")
+
+# ========= 保存系（Sheets/CSV） =========
+def try_append_to_google_sheets(row_dict: dict, spreadsheet_id: str, service_json_str: str):
+    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+    info = json.loads(service_json_str)
+    creds = Credentials.from_service_account_info(info, scopes=scopes)
+    gc = gspread.authorize(creds)
+    sh = gc.open_by_key(spreadsheet_id)
+    ws = sh.sheet1
+    if not ws.get_all_values():
+        ws.append_row(list(row_dict.keys()))
+    ws.append_row([row_dict[k] for k in row_dict.keys()])
+
+def fallback_append_to_csv(row_dict: dict, csv_path="responses.csv"):
+    df = pd.DataFrame([row_dict])
+    if os.path.exists(csv_path):
+        df.to_csv(csv_path, mode="a", header=False, index=False, encoding="utf-8")
+    else:
+        df.to_csv(csv_path, index=False, encoding="utf-8")
+
+def auto_save_row(row: dict):
+    """ユーザーには何も表示しない。
+    - Sheets設定があれば Sheets に追記
+    - 無ければ CSV に追記
+    - 失敗時は events に記録（画面表示なし）
+    """
+    secret_json     = read_secret("GOOGLE_SERVICE_JSON", None)
+    # Base64フォールバック（必要な場合）
+    if not secret_json:
+        b64 = read_secret("GOOGLE_SERVICE_JSON_BASE64", None)
+        if b64:
+            try:
+                secret_json = base64.b64decode(b64).decode("utf-8")
+            except Exception as e:
+                _report_event("ERROR", f"Base64デコード失敗: {e}", {})
+    secret_sheet_id = read_secret("SPREADSHEET_ID", None)
+
+    def _append_csv():
+        try:
+            fallback_append_to_csv(row)
+        except Exception as e2:
+            _report_event("ERROR", f"CSV保存に失敗: {e2}", {"row_head": {k: row.get(k) for k in list(row)[:6]}})
+
+    try:
+        if secret_json and secret_sheet_id:
+            try_append_to_google_sheets(row, secret_sheet_id, secret_json)
+        else:
+            _append_csv()
+    except Exception as e:
+        _append_csv()
+        _report_event("WARN", f"Sheets保存に失敗しCSVへフォールバック: {e}", {"reason": str(e)})
+
 # ========= サイドバー =========
 with st.sidebar:
     logo_path = path_or_download_logo()
@@ -170,9 +242,28 @@ with st.sidebar:
 st.title("製造現場の“隠れたムダ”をあぶり出す｜3分無料診断")
 st.write("**10問**に回答するだけで、貴社のリスク“構造”を可視化します。")
 
+# ========= セッション初期化 =========
+defaults = {
+    "result_ready": False, "df": None, "overall_avg": None, "signal": None,
+    "main_type": None, "company": "", "email": "",
+    "ai_comment": None, "ai_tried": False,
+    "utm_source": "", "utm_medium": "", "utm_campaign": ""
+}
+for k, v in defaults.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
+
+# ========= UTM取得 =========
+try:
+    q = st.query_params
+except Exception:
+    q = st.experimental_get_query_params()
+st.session_state["utm_source"]   = q.get("utm_source",   [""])[0] if isinstance(q.get("utm_source"), list) else q.get("utm_source", "")
+st.session_state["utm_medium"]   = q.get("utm_medium",   [""])[0] if isinstance(q.get("utm_medium"), list) else q.get("utm_medium", "")
+st.session_state["utm_campaign"] = q.get("utm_campaign", [""])[0] if isinstance(q.get("utm_campaign"), list) else q.get("utm_campaign", "")
+
 # ========= バリデーション =========
 EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
-
 def validate_inputs(company: str, email: str) -> tuple[bool, str]:
     if not company.strip():
         return False, "会社名は必須です。"
@@ -182,8 +273,8 @@ def validate_inputs(company: str, email: str) -> tuple[bool, str]:
         return False, "メールアドレスの形式が正しくありません。"
     return True, ""
 
-# ========= 設問 UI =========
-YN3 = ["Yes", "部分的に", "No"]
+# ========= 設問 =========
+YN3  = ["Yes", "部分的に", "No"]
 FIVE = ["5（非常にある）", "4", "3", "2", "1（まったくない）"]
 
 with st.form("diagnose_form"):
@@ -223,7 +314,7 @@ def to_score_yn3(ans: str, invert=False) -> int:
 def to_score_5scale(ans: str) -> int:
     return int(ans[0])
 
-# ========= 型・コメント（静的デフォルト） =========
+# ========= 型テキスト =========
 TYPE_TEXT = {
     "在庫滞留型": "過剰在庫やWIP滞留で資金が眠っている可能性が高い状態です。生産量ではなく“流れ”の設計に軸足を移しましょう。",
     "熟練依存型": "属人化により技能がブラックボックス化。ベテラン離職に伴う急落リスクが高い状態です。技能棚卸と多能工化の設計が急務です。",
@@ -233,148 +324,20 @@ TYPE_TEXT = {
     "バランス良好型": "リスク分散と仕組み成熟が進んでいます。次の一手は“利益を生むデータ活用”と継続的なリードタイム短縮です。"
 }
 
-# ========= 保存系（Sheets / CSV）=========
-def try_append_to_google_sheets(row_dict: dict, spreadsheet_id: str, service_json_str: str):
-    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
-    info = json.loads(service_json_str)
-    creds = Credentials.from_service_account_info(info, scopes=scopes)
-    gc = gspread.authorize(creds)
-    sh = gc.open_by_key(spreadsheet_id)
-    ws = sh.sheet1
-    if not ws.get_all_values():
-        ws.append_row(list(row_dict.keys()))
-    ws.append_row([row_dict[k] for k in row_dict.keys()])
-
-def fallback_append_to_csv(row_dict: dict, csv_path="responses.csv"):
-    df = pd.DataFrame([row_dict])
-    if os.path.exists(csv_path):
-        df.to_csv(csv_path, mode="a", header=False, index=False, encoding="utf-8")
-    else:
-        df.to_csv(csv_path, index=False, encoding="utf-8")
-
-def _report_event(level: str, message: str, payload: dict | None = None):
-    """障害・警告を“管理者だけ”が後から確認できるように記録する。
-    優先: Google Sheets の 'events' ワークシート → 無ければ CSV(events.csv)
-    ※ 画面には何も出さない。ADMIN_MODE のときのみ通知表示。
-    """
-    evt = {
-        "timestamp": datetime.now(JST).isoformat(timespec="seconds"),
-        "level": level,
-        "message": message,
-        "payload": json.dumps(payload, ensure_ascii=False) if payload else ""
-    }
-
-    # まず Sheets 側に記録を試みる
-    secret_json     = read_secret("GOOGLE_SERVICE_JSON", None)
-    secret_sheet_id = read_secret("SPREADSHEET_ID", None)
-    wrote = False
-    try:
-        if secret_json and secret_sheet_id:
-            scopes = ["https://www.googleapis.com/auth/spreadsheets"]
-            info = json.loads(secret_json)
-            creds = Credentials.from_service_account_info(info, scopes=scopes)
-            gc = gspread.authorize(creds)
-            sh = gc.open_by_key(secret_sheet_id)
-            try:
-                ws = sh.worksheet("events")
-            except gspread.WorksheetNotFound:
-                ws = sh.add_worksheet(title="events", rows=1000, cols=6)
-                ws.append_row(list(evt.keys()))
-            ws.append_row([evt[k] for k in evt.keys()])
-            wrote = True
-    except Exception:
-        wrote = False
-
-    # フォールバック：CSVに追記
-    if not wrote:
-        try:
-            df = pd.DataFrame([evt])
-            csv_path = "events.csv"
-            if os.path.exists(csv_path):
-                df.to_csv(csv_path, mode="a", header=False, index=False, encoding="utf-8")
-            else:
-                df.to_csv(csv_path, index=False, encoding="utf-8")
-        except Exception:
-            pass  # それでも無視（ユーザーには出さない）
-
-    # 管理者モードのときだけ画面に小さく知らせる
-    if ADMIN_MODE:
-        st.caption(f"［ADMIN］{level}: {message}")
-def auto_save_row(row: dict):
-    """ユーザーには何も表示しない。
-    - Sheets設定があれば Sheets に追記
-    - なければ CSV に追記
-    - いずれか失敗した場合：管理者ログ（events）に記録。画面表示はしない。
-    """
-    secret_json     = read_secret("GOOGLE_SERVICE_JSON", None)
-    secret_sheet_id = read_secret("SPREADSHEET_ID", None)
-
-    def _append_csv():
-        try:
-            fallback_append_to_csv(row)
-        except Exception as e2:
-            _report_event("ERROR", f"CSV保存に失敗: {e2}", {"row_head": {k: row.get(k) for k in list(row)[:6]}})
-
-    try:
-        if secret_json and secret_sheet_id:
-            try_append_to_google_sheets(row, secret_sheet_id, secret_json)
-        else:
-            _append_csv()
-    except Exception as e:
-        # Sheets失敗 → CSVへフォールバックも失敗ならイベント記録
-        _append_csv()
-        _report_event("WARN", f"Sheets保存に失敗しCSVへフォールバック: {e}", {"reason": str(e)})
-
-
-# ========= 図・QRユーティリティ =========
-def build_bar_png(df: pd.DataFrame) -> bytes:
-    fig, ax = plt.subplots(figsize=(5.0, 2.4), dpi=220)
-    df_sorted = df.sort_values("平均スコア", ascending=True)
-    ax.barh(df_sorted["カテゴリ"], df_sorted["平均スコア"])
-    ax.set_xlim(0, 5)
-    ax.set_xlabel("平均スコア（0-5）")
-    ax.grid(axis="x", linestyle="--", alpha=0.3)
-    if FONT_PATH_IN_USE:
-        from matplotlib import font_manager as fm
-        fp = fm.FontProperties(fname=FONT_PATH_IN_USE)
-        ax.set_xlabel("平均スコア（0-5）", fontproperties=fp)
-        for label in ax.get_yticklabels(): label.set_fontproperties(fp)
-        for label in ax.get_xticklabels(): label.set_fontproperties(fp)
-    buf = io.BytesIO()
-    fig.tight_layout()
-    fig.savefig(buf, format="png")
-    plt.close(fig); buf.seek(0)
-    return buf.read()
-
-def image_with_max_width(path: str, max_w: int):
-    with PILImage.open(path) as im:
-        w, h = im.size
-    if w <= max_w:
-        return Image(path, width=w, height=h)
-    new_h = h * (max_w / w)
-    return Image(path, width=max_w, height=new_h)
-
-def build_qr_png(data_url: str) -> bytes:
-    img = qrcode.make(data_url)
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    buf.seek(0)
-    return buf.read()
-
-# ========= OpenAI: AIコメント自動生成 =========
+# ========= OpenAI: AIコメント =========
 def _openai_client(api_key: str):
     try:
-        from openai import OpenAI  # 新SDK
+        from openai import OpenAI
         return "new", OpenAI(api_key=api_key)
     except Exception:
-        import openai  # 旧SDK
+        import openai
         openai.api_key = api_key
         return "old", openai
 
 def generate_ai_comment(company: str, main_type: str, df_scores: pd.DataFrame, overall_avg: float):
     api_key = read_secret("OPENAI_API_KEY", None)
     if not api_key:
-        return None, "OpenAIのAPIキーが未設定です（Settings→Secrets または環境変数に OPENAI_API_KEY を設定）。"
+        return None, "OpenAIのAPIキーが未設定です。"
     worst2 = df_scores.sort_values("平均スコア", ascending=True).head(2)["カテゴリ"].tolist()
     user_prompt = f"""
 あなたは元製造部長の経営コンサルタントです。以下の診断結果を受け、経営者向けに約300字（260〜340字）の具体的コメントを日本語で書いてください。箇条書きは使わず、1段落で、余計な前置きや免責は不要。最後は「90分スポット診断」での次アクションを自然に促す一文で締めます。
@@ -413,13 +376,49 @@ def generate_ai_comment(company: str, main_type: str, df_scores: pd.DataFrame, o
             text = resp.choices[0].message["content"].strip()
         return text, None
     except Exception as e:
+        _report_event("ERROR", f"AIコメント生成エラー: {e}", {})
         return None, f"AIコメント生成でエラー: {e}"
 
-def clamp_comment(text: str, max_chars: int = CLAMP_CHAR_LIMIT) -> str:
+def clamp_comment(text: str, max_chars: int = 520) -> str:
     if not text:
         return ""
     t = " ".join(text.strip().split())
     return t if len(t) <= max_chars else (t[:max_chars - 1] + "…")
+
+# ========= 図・QRユーティリリティ =========
+def build_bar_png(df: pd.DataFrame) -> bytes:
+    fig, ax = plt.subplots(figsize=(5.0, 2.4), dpi=220)
+    df_sorted = df.sort_values("平均スコア", ascending=True)
+    ax.barh(df_sorted["カテゴリ"], df_sorted["平均スコア"])
+    ax.set_xlim(0, 5)
+    ax.set_xlabel("平均スコア（0-5）")
+    ax.grid(axis="x", linestyle="--", alpha=0.3)
+    if FONT_PATH_IN_USE:
+        from matplotlib import font_manager as fm
+        fp = fm.FontProperties(fname=FONT_PATH_IN_USE)
+        ax.set_xlabel("平均スコア（0-5）", fontproperties=fp)
+        for label in ax.get_yticklabels(): label.set_fontproperties(fp)
+        for label in ax.get_xticklabels(): label.set_fontproperties(fp)
+    buf = io.BytesIO()
+    fig.tight_layout()
+    fig.savefig(buf, format="png")
+    plt.close(fig); buf.seek(0)
+    return buf.read()
+
+def image_with_max_width(path: str, max_w: int):
+    with PILImage.open(path) as im:
+        w, h = im.size
+    if w <= max_w:
+        return Image(path, width=w, height=h)
+    new_h = h * (max_w / w)
+    return Image(path, width=max_w, height=new_h)
+
+def build_qr_png(data_url: str) -> bytes:
+    img = qrcode.make(data_url)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    buf.seek(0)
+    return buf.read()
 
 # ========= PDF生成 =========
 def make_pdf_bytes(result: dict, df_scores: pd.DataFrame, brand_hex=BRAND_BG) -> bytes:
@@ -459,7 +458,7 @@ def make_pdf_bytes(result: dict, df_scores: pd.DataFrame, brand_hex=BRAND_BG) ->
     elems.append(Spacer(1, 6))
 
     elems.append(Paragraph("診断コメント", h3))
-    elems.append(Paragraph(clamp_comment(result["comment"], CLAMP_CHAR_LIMIT), normal))
+    elems.append(Paragraph(clamp_comment(result["comment"], 520), normal))
     elems.append(Spacer(1, 6))
 
     table_data = [["カテゴリ", "平均スコア（0-5）"]] + [
@@ -485,7 +484,7 @@ def make_pdf_bytes(result: dict, df_scores: pd.DataFrame, brand_hex=BRAND_BG) ->
     elems.append(Image(bar_tmp.name, width=390, height=180))
     elems.append(Spacer(1, 6))
 
-    # 次の一手（QR）
+    # 次の一手（QR右寄せ）
     elems.append(Paragraph("次の一手（90分スポット診断のご案内）", h3))
     url_par = Paragraph(f"詳細・お申込み：<u>{CTA_URL}</u>", normal)
     qr_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
@@ -502,9 +501,8 @@ def make_pdf_bytes(result: dict, df_scores: pd.DataFrame, brand_hex=BRAND_BG) ->
     buf.seek(0)
     return buf.read()
 
-# ========= 計算＆セッション保存 =========
+# ========= 計算＆表示 =========
 if submitted:
-    # 必須チェック
     ok, msg = validate_inputs(company, email)
     if not ok:
         st.error(msg)
@@ -554,7 +552,7 @@ if submitted:
         "result_ready": True, "ai_comment": None, "ai_tried": False
     })
 
-# ========= 結果画面 =========
+# 結果画面
 if st.session_state.get("result_ready"):
     df = st.session_state["df"]
     overall_avg = st.session_state["overall_avg"]
@@ -564,7 +562,7 @@ if st.session_state.get("result_ready"):
     email = st.session_state["email"]
     current_time = datetime.now(JST).strftime("%Y-%m-%d %H:%M")
 
-    # --- AIコメントを自動生成（初回のみ） ---
+    # AIコメント自動生成（初回のみ）
     if not st.session_state["ai_tried"]:
         st.session_state["ai_tried"] = True
         text, err = generate_ai_comment(company, main_type, df, overall_avg)
@@ -572,7 +570,7 @@ if st.session_state.get("result_ready"):
             st.session_state["ai_comment"] = text
         elif err:
             st.session_state["ai_comment"] = None
-            st.toast("AIコメントは未設定のため、静的コメントを表示します。", icon="ℹ️")
+            _report_event("WARN", f"AIコメント未生成: {err}", {})
 
     st.markdown("### 診断結果")
     st.markdown(
@@ -603,14 +601,14 @@ if st.session_state.get("result_ready"):
     st.altair_chart(chart, use_container_width=True)
     st.dataframe(df.style.format({"平均スコア": "{:.2f}"}), use_container_width=True)
 
-    # --- 画面にもAIコメントを自動表示 ---
+    # 画面にもAIコメント自動表示
     st.subheader("AIコメント（自動生成）")
     if st.session_state["ai_comment"]:
         st.write(st.session_state["ai_comment"])
     else:
         st.caption("（OpenAI APIキー未設定等のため、PDFには静的コメントを挿入します）")
 
-    # PDF: AIコメントがあれば優先、なければ静的文言
+    # PDF
     comment_for_pdf = st.session_state["ai_comment"] or TYPE_TEXT[main_type]
     result_payload = {
         "company": company,
@@ -624,17 +622,17 @@ if st.session_state.get("result_ready"):
     fname = f"VC_診断_{company or '匿名'}_{datetime.now(JST).strftime('%Y%m%d_%H%M')}.pdf"
     st.download_button("📄 PDFをダウンロード", data=pdf_bytes, file_name=fname, mime="application/pdf")
 
-    # ===== 自動保存（ここが今回の追加）=====
+    # 自動保存（サイレント）
     row = {
         "timestamp": datetime.now(JST).isoformat(timespec="seconds"),
         "company": company, "email": email,
         "signal": signal[0], "main_type": main_type,
         "overall_avg": f"{overall_avg:.2f}",
-        "inv_avg": f"{df.loc[df['カテゴリ']=='在庫・運搬','平均スコア'].values[0]:.2f}",
-        "skills_avg": f"{df.loc[df['カテゴリ']=='人材・技能承継','平均スコア'].values[0]:.2f}",
-        "cost_avg": f"{df.loc[df['カテゴリ']=='原価意識・改善文化','平均スコア'].values[0]:.2f}",
-        "plan_avg": f"{df.loc[df['カテゴリ']=='生産計画・変動対応','平均スコア'].values[0]:.2f}",
-        "dx_avg": f"{df.loc[df['カテゴリ']=='DX・情報共有','平均スコア'].values[0]:.2f}",
+        "inv_avg":   f"{df.loc[df['カテゴリ']=='在庫・運搬','平均スコア'].values[0]:.2f}",
+        "skills_avg":f"{df.loc[df['カテゴリ']=='人材・技能承継','平均スコア'].values[0]:.2f}",
+        "cost_avg":  f"{df.loc[df['カテゴリ']=='原価意識・改善文化','平均スコア'].values[0]:.2f}",
+        "plan_avg":  f"{df.loc[df['カテゴリ']=='生産計画・変動対応','平均スコア'].values[0]:.2f}",
+        "dx_avg":    f"{df.loc[df['カテゴリ']=='DX・情報共有','平均スコア'].values[0]:.2f}",
         "ai_comment": st.session_state["ai_comment"] or "",
         "utm_source": st.session_state["utm_source"],
         "utm_medium": st.session_state["utm_medium"],
@@ -645,9 +643,9 @@ if st.session_state.get("result_ready"):
 else:
     st.caption("フォームに回答し、「診断する」を押してください。")
 
+# ========= 管理者UI（任意） =========
 if ADMIN_MODE:
     with st.expander("ADMIN：イベントログの確認（最新50件）"):
-        # Sheets優先
         secret_json     = read_secret("GOOGLE_SERVICE_JSON", None)
         secret_sheet_id = read_secret("SPREADSHEET_ID", None)
         shown = False
@@ -667,8 +665,6 @@ if ADMIN_MODE:
         except Exception:
             pass
         if not shown:
-            # CSVフォールバックの表示
-            import os
             if os.path.exists("events.csv"):
                 df_evt = pd.read_csv("events.csv").sort_values("timestamp", ascending=False).head(50)
                 st.dataframe(df_evt, use_container_width=True)
