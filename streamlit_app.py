@@ -366,6 +366,7 @@ def generate_ai_comment(company: str, main_type: str, df_scores: pd.DataFrame, o
     api_key = read_secret("OPENAI_API_KEY", None)
     if not api_key:
         return None, "OpenAIのAPIキーが未設定です。"
+
     worst2 = df_scores.sort_values("平均スコア", ascending=True).head(2)["カテゴリ"].tolist()
     user_prompt = f"""
 あなたは元製造部長の経営コンサルタントです。以下の診断結果を受け、経営者向けに約300字（260〜340字）の具体的コメントを日本語で書いてください。箇条書きは使わず、1段落で、余計な前置きや免責は不要。最後は「90分スポット診断」での次アクションを自然に促す一文で締めます。
@@ -379,33 +380,41 @@ def generate_ai_comment(company: str, main_type: str, df_scores: pd.DataFrame, o
 """.strip()
 
     mode, client = _openai_client(api_key)
-    try:
-        if mode == "new":
-            resp = client.chat.completions.create(
-                model=OPENAI_MODEL,
-                messages=[
-                    {"role": "system", "content": "専門的かつ簡潔。日本語。実務に直結する助言を。"},
-                    {"role": "user", "content": user_prompt},
-                ],
-                temperature=0.4,
-                max_tokens=420,
-            )
-            text = resp.choices[0].message.content.strip()
-        else:
-            resp = client.ChatCompletion.create(
-                model=OPENAI_MODEL,
-                messages=[
-                    {"role": "system", "content": "専門的かつ簡潔。日本語。実務に直結する助言を。"},
-                    {"role": "user", "content": user_prompt},
-                ],
-                temperature=0.4,
-                max_tokens=420,
-            )
-            text = resp.choices[0].message["content"].strip()
-        return text, None
-    except Exception as e:
-        _report_event("ERROR", f"AIコメント生成エラー: {e}", {})
-        return None, f"AIコメント生成でエラー: {e}"
+
+    import time
+    for attempt in range(2):  # 最大2回トライ
+        try:
+            if mode == "new":
+                resp = client.chat.completions.create(
+                    model=OPENAI_MODEL,
+                    messages=[
+                        {"role": "system", "content": "専門的かつ簡潔。日本語。実務に直結する助言を。"},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    temperature=0.4,
+                    max_tokens=420,
+                )
+                return resp.choices[0].message.content.strip(), None
+            else:
+                resp = client.ChatCompletion.create(
+                    model=OPENAI_MODEL,
+                    messages=[
+                        {"role": "system", "content": "専門的かつ簡潔。日本語。実務に直結する助言を。"},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    temperature=0.4,
+                    max_tokens=420,
+                )
+                return resp.choices[0].message["content"].strip(), None
+
+        except Exception as e:
+            # 429/一時エラー系は少し待って再試行
+            if attempt == 0:
+                time.sleep(4)  # バックオフ
+                continue
+            _report_event("ERROR", f"AIコメント生成エラー: {e}", {})
+            return None, f"AIコメント生成でエラー: {e}"
+
 
 def clamp_comment(text: str, max_chars: int = 520) -> str:
     if not text:
