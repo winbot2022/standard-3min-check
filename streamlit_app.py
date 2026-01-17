@@ -1,276 +1,254 @@
-# app.py
-import os
-import json
-import random
-import traceback
-import urllib.request
-import urllib.error
+# -*- coding: utf-8 -*-
 import streamlit as st
+from dataclasses import dataclass
+from typing import List, Dict, Any
 
 # =========================
-# 基本設定（保存なし／画面表示のみ）
+# 1) 差し替え集約（ここだけ触れば 1社専用化できる）
 # =========================
-st.set_page_config(page_title="3分・元気が出る名言診断", page_icon="🌤", layout="centered")
-st.title("🌤 3分・元気が出る名言診断")
-st.caption("30問からランダムに10問。回答は保存しません。POWERを押すと、その場で名言が表示されます。")
-
-# ============== 環境変数（任意） ==============
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-MODEL_NAME = os.getenv("MODEL_NAME", "gpt-4o-mini").strip() or "gpt-4o-mini"
-# エラーイベント送信先（任意。設定があればPOSTします）
-EVENTS_WEBHOOK_URL = os.getenv("EVENTS_WEBHOOK_URL", "").strip()
-
-# =========================
-# 便利: エラーイベント送信（任意）
-# =========================
-def send_error_event(code: str, detail: str = ""):
-    """
-    既存の「eventsとして、エラーコードだけ受け取る」仕様を最小維持。
-    EVENTS_WEBHOOK_URL が設定されている時のみ JSON POST。未設定なら何もしません。
-    JSON 例: {"event":"error","code":"OPENAI_CALL_FAILED","detail":"..."}
-    """
-    if not EVENTS_WEBHOOK_URL:
-        return
-    payload = {"event": "error", "code": code, "detail": detail}
-    data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        EVENTS_WEBHOOK_URL,
-        data=data,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            _ = resp.read()
-    except Exception:
-        # ここでさらに例外を投げない（画面側は静かに継続）
-        pass
+CONFIG: Dict[str, Any] = {
+    "app_title": "3分で気持ちを整理",
+    "app_subtitle": "相談する前に、いまの状況を言葉にしてみるためのチェックです。",
+    "intro_notes": [
+        "・点数や評価はありません。",
+        "・答えに正解はありません。",
+        "・ここで結論を出す必要はありません。",
+    ],
+    "cta": {
+        "title": "一度、気持ちを整理してみませんか？",
+        "note": "※ここは後で、契約先（1社専用）の名称・リンクに差し替えます",
+        "button_label": "相談窓口を見る（仮）",
+        "url": "https://example.com",  # 仮リンク
+    },
+    "footer": "© Victor Consulting / Standard 3min-check (Phase0)",
+}
 
 # =========================
-# 質問バンク（30問）: axis = act/conn/acc, polarity = pos/neg
+# 2) 設問定義（8問：将来10問に増やしてもここを増やすだけ）
+#    - 各選択肢に「気になるポイント（タグ）」を紐づける
+#    - タグは“評価”ではなく “整理の観点” として扱う
 # =========================
-CHOICES = {"はい": 2, "どちらでも": 1, "いいえ": 0}
-DEFAULT_INDEX = 1
-HIGH_THRESH = 60  # 0～100のサブスコアで高い判定
+@dataclass
+class Option:
+    label: str
+    tags: List[str]
 
-QUESTIONS_BANK = [
-    # --- 活力・挑戦（act）10問 ---
-    ("朝、起きたとき『今日はやってみよう』と思えることが多いですか？", "act", "pos"),
-    ("やるべきことに手をつけるまでの時間は短いほうですか？", "act", "pos"),
-    ("最近、新しいことに少しでも興味がわきますか？", "act", "pos"),
-    ("うまくいかなくても、また試してみようと思えますか？", "act", "pos"),
-    ("先延ばしが増えていると感じますか？", "act", "neg"),
-    ("今日は小さな一歩でも進めそうだと感じますか？", "act", "pos"),
-    ("目標を立てるのが少しおっくうだと感じますか？", "act", "neg"),
-    ("『まずはやってみる』と思える瞬間がありますか？", "act", "pos"),
-    ("最近、気力のバッテリーが切れがちだと感じますか？", "act", "neg"),
-    ("完璧でなくても動き出せるほうですか？", "act", "pos"),
-    # --- つながり・他者（conn）10問 ---
-    ("最近、誰かに『ありがとう』と言えましたか？", "conn", "pos"),
-    ("困ったら人に頼ってもよいと感じますか？", "conn", "pos"),
-    ("一人で抱え込みがちだと感じますか？", "conn", "neg"),
-    ("だれかの役に立てたと思える出来事がありましたか？", "conn", "pos"),
-    ("会話や雑談の機会が減っていると感じますか？", "conn", "neg"),
-    ("弱さを見せても大丈夫だと思える相手がいますか？", "conn", "pos"),
-    ("最近、孤立感を覚えることが多いですか？", "conn", "neg"),
-    ("ちいさな親切を受け取れた（または渡せた）と感じますか？", "conn", "pos"),
-    ("助けを求めるのが苦手だと感じますか？", "conn", "neg"),
-    ("人と一緒にやると元気が出やすいと感じますか？", "conn", "pos"),
-    # --- 自己受容・安らぎ（acc）10問 ---
-    ("『いまは少し休んでもいい』と思えますか？", "acc", "pos"),
-    ("最近、自分を責める回数が増えていますか？", "acc", "neg"),
-    ("自然や空模様を見て『きれいだな』と感じることがありますか？", "acc", "pos"),
-    ("うまくできない自分を許せない、と感じることが多いですか？", "acc", "neg"),
-    ("深呼吸すると少し楽になる気がしますか？", "acc", "pos"),
-    ("焦りや不安で頭がいっぱいになりがちですか？", "acc", "neg"),
-    ("『今日は今日でいい』と思える瞬間がありますか？", "acc", "pos"),
-    ("休むことに罪悪感を覚えますか？", "acc", "neg"),
-    ("小さな喜びを見つける余裕が少しありますか？", "acc", "pos"),
-    ("完璧でない自分を受け入れられそうですか？", "acc", "pos"),
+@dataclass
+class Question:
+    key: str
+    title: str
+    options: List[Option]
+
+QUESTIONS: List[Question] = [
+    Question(
+        key="q1",
+        title="いまの気持ちに一番近いものは？",
+        options=[
+            Option("少し不安がある", ["不安"]),
+            Option("迷いが続いている", ["迷い"]),
+            Option("焦りがある", ["焦り"]),
+            Option("落ち着いているが確認したい", ["整理"]),
+        ],
+    ),
+    Question(
+        key="q2",
+        title="気になっているのはどんなこと？",
+        options=[
+            Option("相手との関係性", ["関係性"]),
+            Option("自分の気持ちの揺れ", ["感情"]),
+            Option("将来の見通し", ["将来"]),
+            Option("周囲の目・比較", ["周囲"]),
+        ],
+    ),
+    Question(
+        key="q3",
+        title="いま、頭の中はどんな状態？",
+        options=[
+            Option("情報が多くて混乱している", ["混乱"]),
+            Option("考えが堂々巡りしている", ["迷い"]),
+            Option("決めなきゃと追われている", ["焦り"]),
+            Option("整理すれば前に進めそう", ["整理"]),
+        ],
+    ),
+    Question(
+        key="q4",
+        title="いま一番しんどいのは？",
+        options=[
+            Option("気持ちの上下が大きい", ["感情"]),
+            Option("相手の気持ちが読めない", ["関係性", "不安"]),
+            Option("自分の判断に自信がない", ["不安", "迷い"]),
+            Option("時間だけが過ぎていく感覚", ["焦り"]),
+        ],
+    ),
+    Question(
+        key="q5",
+        title="相談したい気持ちはありますか？",
+        options=[
+            Option("相談したいが、まだ言語化できない", ["言語化", "不安"]),
+            Option("相談したいが、誰に話すべきか迷う", ["相談先", "迷い"]),
+            Option("相談まではいかないが整理したい", ["整理"]),
+            Option("いまは一人で考えたい", ["自分軸"]),
+        ],
+    ),
+    Question(
+        key="q6",
+        title="いま欲しいのはどれに近い？",
+        options=[
+            Option("背中を押してほしい", ["後押し", "焦り"]),
+            Option("状況を客観視したい", ["整理"]),
+            Option("気持ちを受け止めてほしい", ["感情"]),
+            Option("選択肢を増やしたい", ["選択肢"]),
+        ],
+    ),
+    Question(
+        key="q7",
+        title="行動に移すとしたら、どれが一番ラク？",
+        options=[
+            Option("短くメモする", ["言語化"]),
+            Option("誰かに少しだけ話す", ["相談先"]),
+            Option("一旦休む・距離を置く", ["休息"]),
+            Option("情報を整理して優先順位をつける", ["整理"]),
+        ],
+    ),
+    Question(
+        key="q8",
+        title="今日このチェックで得たいのは？",
+        options=[
+            Option("気持ちを落ち着かせたい", ["感情", "休息"]),
+            Option("考えを整理したい", ["整理", "言語化"]),
+            Option("次の一歩を決めたいが、決め切れない", ["迷い"]),
+            Option("何が引っかかっているか知りたい", ["不安", "整理"]),
+        ],
+    ),
 ]
 
 # =========================
-# 名言カタログ（タイプ別）
+# 3) 整理結果生成（評価ではなく “観点の抽出”）
 # =========================
-QUOTE_CATALOG = {
-    "RESTART": [
-        ("夜明け前がいちばん暗い。", "英語のことわざ"),
-        ("休むことも、仕事のうち。", "レオナルド・ダ・ヴィンチ"),
-        ("ゆっくりでいい。止まらなければ、必ず着く。", "孔子『論語』意"),
-        ("嵐のあとは、道が見える。", "匿名"),
-        ("小さな前進は、偉大な停滞より価値がある。", "匿名"),
-        ("倒れても、上を向いて倒れなさい。", "チャールズ・チャップリン意"),
-    ],
-    "CHALLENGE": [
-        ("行動こそ、恐れを越える唯一の方法。", "匿名"),
-        ("できると思えばできる。思わなければできない。", "ヘンリー・フォード"),
-        ("道は歩く者にだけ姿を見せる。", "匿名"),
-        ("失敗は、より賢く再挑戦するための授業料。", "ヘンリー・フォード意"),
-        ("最初の一歩が、いちばん道を変える。", "匿名"),
-        ("やってみなければ、何も始まらない。", "アリストテレス意"),
-    ],
-    "CALM": [
-        ("花は咲く時を、自分で知っている。", "匿名"),
-        ("今日は今日を、十分に生きればいい。", "セネカ意"),
-        ("木は急がない。それでも、ちゃんと伸びている。", "匿名"),
-        ("心を静めることは、次の力を集めること。", "老子意"),
-        ("呼吸を整えよ。道はそれからでいい。", "禅語意"),
-        ("波が静まれば、水面は空を映す。", "匿名"),
-    ],
-}
-TYPE_LABELS = {
-    "RESTART": "再起の光（やさしい背中押し）",
-    "CHALLENGE": "挑戦の炎（行動の一押し）",
-    "CALM": "静かな充電（受容と整え）",
-}
+def collect_tags(answers: Dict[str, str]) -> List[str]:
+    tags: List[str] = []
+    option_map: Dict[str, Dict[str, List[str]]] = {}
+    for q in QUESTIONS:
+        option_map[q.key] = {opt.label: opt.tags for opt in q.options}
+
+    for q in QUESTIONS:
+        a = answers.get(q.key)
+        if not a:
+            continue
+        tags.extend(option_map[q.key].get(a, []))
+    return tags
+
+def summarize_state(tags: List[str]) -> str:
+    # できるだけ“断定・評価”を避けた短文
+    # タグの傾向に応じて言い回しだけ変える（点数/タイプ化しない）
+    if not tags:
+        return "いくつか答えてみたことで、いまの気持ちの輪郭が少し見えてきた状態です。"
+    if "焦り" in tags and ("不安" in tags or "迷い" in tags):
+        return "「急いだほうがいい気持ち」と「慎重になりたい気持ち」が同時に動いているようです。"
+    if "整理" in tags and "言語化" in tags:
+        return "考えを“言葉に置く”ことで、気持ちが落ち着いていきそうな流れです。"
+    if "感情" in tags:
+        return "いまは気持ちの揺れがポイントになっていそうです。まずは受け止めるだけでも十分です。"
+    return "いまの状況を“整理の観点”に分けて眺められる状態になっています。"
+
+def ordered_points(tags: List[str]) -> List[str]:
+    # 順番は出してよいが、数値は出さない
+    freq: Dict[str, int] = {}
+    for t in tags:
+        freq[t] = freq.get(t, 0) + 1
+    # 出現回数の多い順（同数は安定ソート）
+    ordered = sorted(freq.items(), key=lambda x: (-x[1], x[0]))
+    return [k for k, _ in ordered]
+
+def next_steps(points: List[str]) -> List[str]:
+    # 行動を強制しない “選択肢” を提示
+    base = [
+        "今日は結論を出さず、「何が気になっているか」だけをメモに残す",
+        "信頼できる人に、結論なしで「いまの気持ち」だけ話してみる",
+        "24時間だけ“決めない”と決めて、休んでからもう一度考える",
+    ]
+    # 観点に応じて、軽い提案を1つだけ足す（断定しない）
+    if "言語化" in points:
+        base.insert(0, "頭の中の言葉を、箇条書きで3行だけ書き出してみる")
+    if "相談先" in points:
+        base.append("相談するなら「結論を急がない相談」であることを先に伝える")
+    if "整理" in points:
+        base.append("気になる点を「自分／相手／周囲／将来」に分けて眺めてみる")
+    # 重複を除去しつつ順番維持
+    seen = set()
+    uniq = []
+    for x in base:
+        if x not in seen:
+            uniq.append(x); seen.add(x)
+    return uniq[:5]
 
 # =========================
-# スコアリング
+# 4) UI
 # =========================
-def score_item(raw_score: int, polarity: str) -> int:
-    # pos: そのまま（0-2）、neg: 逆転（2-raw）
-    return raw_score if polarity == "pos" else (2 - raw_score)
+def main():
+    st.set_page_config(page_title=CONFIG["app_title"], layout="centered")
 
-def to_percent(subscores) -> int:
-    # subscoresは0-2の合計（設問数×0..2） → 0-100へ
-    max_total = len(subscores) * 2
-    total = sum(subscores)
-    if max_total == 0:
-        return 0
-    return int(round(total / max_total * 100))
+    st.title(CONFIG["app_title"])
+    st.caption(CONFIG["app_subtitle"])
 
-def pick_type(act, conn, acc) -> str:
-    # 単純・頑健：高い軸があればそちら、拮抗/全体低めならRESTART
-    if act >= HIGH_THRESH and act >= acc and act >= conn:
-        return "CHALLENGE"
-    if acc >= HIGH_THRESH and acc >= act and acc >= conn:
-        return "CALM"
-    return "RESTART"
+    with st.expander("このチェックについて", expanded=True):
+        for line in CONFIG["intro_notes"]:
+            st.write(line)
 
-# =========================
-# OpenAIで最適名言を選ぶ（キーなし→ローカル代替）
-# =========================
-def select_quote_with_ai(summary, candidates):
-    """
-    summary: {"act": int, "conn": int, "acc": int, "type": str, "answers":[{q,axis,polarity,choice,score}]}
-    candidates: [{"text": "...", "source": "..."}]  # 3件程度
-    return: {"text": "...", "source": "...", "comment": "..."}  # commentは短い補足
-    """
-    if not OPENAI_API_KEY:
-        # ローカル代替（最初の候補＋タイプに応じた短評）
-        base = {
-            "RESTART": "いまは息を整えて、小さな一歩を。ゆっくりでも進めば必ず変わります。",
-            "CHALLENGE": "考えるよりまず一歩。小さく動くほど、恐れは小さくなります。",
-            "CALM": "休むことは前進の準備。深呼吸から、静かな力が戻ってきます。",
-        }[summary["type"]]
-        return {"text": candidates[0]["text"], "source": candidates[0]["source"], "comment": base}
+    st.divider()
 
-    try:
-        from openai import OpenAI
-        client = OpenAI(api_key=OPENAI_API_KEY)
-        sys = (
-            "あなたは短い励ましに長けた編集者です。ユーザーの回答傾向（act/conn/accスコアとタイプ）を読み、"
-            "提示された候補の中から“いま最も刺さる”名言を厳選してください。"
-            "出力はJSONのみ。キーは text, source, comment。commentは80〜120字の日本語で、"
-            "優しく具体的な一歩を促す短評にしてください。余計な文は出さないでください。"
+    st.subheader("質問（3分）")
+    answers: Dict[str, str] = {}
+
+    for i, q in enumerate(QUESTIONS, start=1):
+        st.write(f"**Q{i}. {q.title}**")
+        labels = [opt.label for opt in q.options]
+        ans = st.radio(
+            label="",
+            options=labels,
+            index=None,
+            key=q.key,
+            horizontal=False,
         )
-        usr = {"summary": summary, "candidates": candidates}
-        resp = client.chat.completions.create(
-            model=MODEL_NAME,
-            messages=[
-                {"role": "system", "content": sys},
-                {"role": "user", "content": json.dumps(usr, ensure_ascii=False)}
-            ],
-            temperature=0.4,
-            max_tokens=300,
-        )
-        content = resp.choices[0].message.content.strip()
-        data = json.loads(content)
-        if not all(k in data for k in ("text", "source", "comment")):
-            raise ValueError("Invalid AI response schema")
-        return data
-    except Exception as e:
-        # 失敗時はイベント送信＋フォールバック
-        send_error_event("OPENAI_CALL_FAILED", f"{type(e).__name__}: {e}")
-        base = {
-            "RESTART": "いまは息を整えて、小さな一歩を。ゆっくりでも進めば必ず変わります。",
-            "CHALLENGE": "考えるよりまず一歩。小さく動くほど、恐れは小さくなります。",
-            "CALM": "休むことは前進の準備。深呼吸から、静かな力が戻ってきます.",
-        }[summary["type"]]
-        return {"text": candidates[0]["text"], "source": candidates[0]["source"], "comment": base}
+        if ans:
+            answers[q.key] = ans
+        st.write("")
 
-# =========================
-# ランダム10問の選出（セッション固定）
-# =========================
-if "question_indices" not in st.session_state:
-    st.session_state.question_indices = random.sample(range(len(QUESTIONS_BANK)), 10)
+    st.divider()
 
-indices = st.session_state.question_indices
+    can_show = (len(answers) == len(QUESTIONS))
+    if not can_show:
+        st.info("すべての質問に答えると、整理結果が表示されます。")
+        return
 
-with st.form("diagnosis"):
-    st.subheader("質問（ランダム10問）")
-    answers = []  # (text, axis, polarity, choice_label, scored_value)
-    for i, idx in enumerate(indices, start=1):
-        qtext, axis, polarity = QUESTIONS_BANK[idx]
-        choice = st.radio(
-            f"Q{i}. {qtext}",
-            list(CHOICES.keys()),
-            horizontal=True,
-            index=DEFAULT_INDEX
-        )
-        raw = CHOICES[choice]
-        scored = score_item(raw, polarity)
-        answers.append((qtext, axis, polarity, choice, scored))
+    tags = collect_tags(answers)
+    points = ordered_points(tags)
 
-    # ========== POWER ボタン ==========
-    # ⏻ (power symbol) / "POWER"
-    submitted = st.form_submit_button("⏻  POWER", use_container_width=True)
+    st.subheader("いまの状態の整理")
+    st.write(summarize_state(tags))
+    st.write("**ここで結論を出す必要はありません。**")
 
-if submitted:
-    try:
-        # サブスコア算出（今回の10問に対して）
-        act_scores = [a[4] for a in answers if a[1] == "act"]
-        conn_scores = [a[4] for a in answers if a[1] == "conn"]
-        acc_scores = [a[4] for a in answers if a[1] == "acc"]
+    st.subheader("気にしているポイント（順番）")
+    if points:
+        for idx, p in enumerate(points, start=1):
+            st.write(f"{idx}. {p}")
+    else:
+        st.write("いくつかの観点が見えてきました。")
 
-        act = to_percent(act_scores)
-        conn = to_percent(conn_scores)
-        acc = to_percent(acc_scores)
+    st.subheader("次の一歩（選択肢）")
+    for s in next_steps(points):
+        st.write(f"・{s}")
 
-        user_type = pick_type(act, conn, acc)
+    st.divider()
 
-        # 候補（タイプ毎にシャッフル→上位3件）
-        cands = QUOTE_CATALOG[user_type][:]
-        random.shuffle(cands)
-        top_candidates = [{"text": t, "source": s} for (t, s) in cands[:3]]
+    st.subheader(CONFIG["cta"]["title"])
+    st.caption(CONFIG["cta"]["note"])
+    st.link_button(CONFIG["cta"]["button_label"], CONFIG["cta"]["url"])
 
-        summary = {
-            "act": act, "conn": conn, "acc": acc, "type": user_type,
-            "answers": [{"q": a[0], "axis": a[1], "polarity": a[2], "choice": a[3], "score": a[4]} for a in answers]
-        }
+    st.caption(CONFIG["footer"])
 
-        result = select_quote_with_ai(summary, top_candidates)
-
-        st.success("診断が完了しました。データは保存していません。")
-        with st.container(border=True):
-            st.markdown(f"**タイプ**：{TYPE_LABELS[user_type]}")
-            st.markdown(f"**あなたに贈る一言**：\n\n> **{result['text']}**\n\n— *{result['source']}*")
-            st.markdown(f"**ひとこと解説**：{result['comment']}")
-
-        with st.expander("サブスコアを見る（任意）"):
-            st.write({
-                "活力・挑戦（activation）": act,
-                "つながり（connection）": conn,
-                "自己受容（acceptance）": acc
-            })
-
-        st.caption("※本ツールは診断・医療行為ではありません。今日の気持ちに寄り添う“言葉の処方箋”です。")
-
-    except Exception as e:
-        # 画面にやさしく表示＋イベント送信
-        err_detail = f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
-        send_error_event("APP_RUNTIME_ERROR", err_detail)
-        st.error("申し訳ありません。処理中にエラーが発生しました。もう一度お試しください。")
+if __name__ == "__main__":
+    main()
 
 
 
