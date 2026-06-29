@@ -23,7 +23,7 @@ CONFIG: Dict[str, Any] = {
         "title": "整理した気持ちを、少し話してみたい方へ",
         "note": "現在、婚活や結婚について相談できる専門家・相談先のご案内準備を進めています。",
         "button_label": "相談先案内のお知らせを受け取る（無料）",
-        "url": "https://forms.gle/ここにGoogleフォームURLを入れる",
+        "url": "https://docs.google.com/forms/d/e/1FAIpQLSf2A9SMwGKeO5ISYRzzlumASxo7jknnwb7qscxWkuZsY4fkww/viewform?usp=publish-editor",
     },
 
     "oem_cta": {
