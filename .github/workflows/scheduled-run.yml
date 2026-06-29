@@ -20,7 +20,7 @@ jobs:
       - name: Create and Commit Ping File
         run: |
           # タイムスタンプをファイルに書き込み、リポジトリに「変更」を生成
-          echo "Streamlit Ping for 3min-engine: $(date +%Y-%m-%d\ %H:%M:%S)" > .streamlit_ping_log
+          echo "Streamlit Ping for standard-3min-check: $(date +%Y-%m-%d\ %H:%M:%S)" > .streamlit_ping_log
           
           # Gitユーザーを設定
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -30,7 +30,7 @@ jobs:
           git add .streamlit_ping_log
           
           # コミット実行
-          git commit -m "Automated Streamlit keep-awake push for 3min-engine"
+          git commit -m "Automated Streamlit keep-awake push for standard-3min-check"
           
           # プッシュ実行
           git push
