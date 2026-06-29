@@ -7,20 +7,34 @@ from typing import List, Dict, Any
 # 1) 差し替え集約（ここだけ触れば 1社専用化できる）
 # =========================
 CONFIG: Dict[str, Any] = {
-    "app_title": "3分で気持ちを整理",
-    "app_subtitle": "相談する前に、いまの状況を言葉にしてみるためのチェックです。",
+    "mode": "portal",  # "portal" or "oem"
+
+    "app_title": "3分 婚活前の気持ち整理チェック",
+    "app_subtitle": "結婚相談所に相談する前に、いまの気持ちを言葉にしてみるためのチェックです。",
+
     "intro_notes": [
         "・点数や評価はありません。",
         "・答えに正解はありません。",
         "・ここで結論を出す必要はありません。",
+        "・氏名やメールアドレスの入力は不要です。",
     ],
-    "cta": {
-        "title": "一度、気持ちを整理してみませんか？",
-        "note": "※ここは後で、契約先（1社専用）の名称・リンクに差し替えます",
-        "button_label": "相談窓口を見る（仮）",
-        "url": "https://example.com",  # 仮リンク
+
+    "portal_cta": {
+        "title": "整理した気持ちを、少し話してみたい方へ",
+        "note": "現在、婚活や結婚について相談できる専門家・相談先のご案内準備を進めています。",
+        "button_label": "相談先案内のお知らせを受け取る（無料）",
+        "url": "https://forms.gle/ここにGoogleフォームURLを入れる",
     },
-    "footer": "© Victor Consulting / Standard 3min-check (Phase0)",
+
+    "oem_cta": {
+        "partner_name": "〇〇結婚相談所",
+        "title": "整理した気持ちを、相談員に少し話してみませんか？",
+        "note": "このチェック結果をもとに、無理に結論を急がず、いまの状況を一緒に整理できます。",
+        "button_label": "〇〇結婚相談所に相談する",
+        "url": "https://example.com",
+    },
+
+    "footer": "© Victor Consulting / 3minDx Standard Check",
 }
 
 # =========================
@@ -241,11 +255,18 @@ def main():
 
     st.divider()
 
-    st.subheader(CONFIG["cta"]["title"])
-    st.caption(CONFIG["cta"]["note"])
-    st.link_button(CONFIG["cta"]["button_label"], CONFIG["cta"]["url"])
-
-    st.caption(CONFIG["footer"])
+    if CONFIG["mode"] == "oem":
+        cta = CONFIG["oem_cta"]
+        st.subheader(cta["title"])
+        st.caption(cta["note"])
+        st.link_button(cta["button_label"], cta["url"])
+    else:
+        cta = CONFIG["portal_cta"]
+        st.subheader(cta["title"])
+        st.caption(cta["note"])
+        st.link_button(cta["button_label"], cta["url"])
+    
+        st.caption(CONFIG["footer"])
 
 if __name__ == "__main__":
     main()
